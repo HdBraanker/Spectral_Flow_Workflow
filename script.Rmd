@@ -1,0 +1,682 @@
+---
+title: "Supplementary file R script spectral workflow"
+author: "H. den Braanker"
+date: "25-8-2021"
+output:
+  word_document: default
+  html_document: default
+  pdf_document: default
+code_folding: show
+---
+
+### Introduction
+This script belongs to paper .... We will walk through the described pipeline with two different spectral flow cytometry datasets. Case A will use the dataset described in the paper and available at:  . Case B will use part of the files of a spectral flow cytometry dataset .. Files to download from this dataset: ...
+If there are difficulties adapting the script to your own dataset, please do not hestitate to contact us: h.denbraanker@erasmusmc.nl or github.
+
+```{r Installing packages, message=FALSE, eval=FALSE}
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("flowCore")
+BiocManager::install("flowViz")
+BiocManager::install("flowVS")
+BiocManager::install("flowAI")
+BiocManager::install("flowAI")
+BiocManager::install("PeacoQC")
+BiocManager::install("CATALYST")
+BiocManager::install("SingleCellExperiment")
+
+if(!requireNamespace("devtools", quietly=TRUE))
+  install.packages("devtools")
+
+devtools::install_github('saeyslab/CytoNorm')
+install.packages("uwot")
+install.packages("knitr")
+install.packages("xlsx")
+```
+
+```{r Load packages, message=FALSE}
+set.seed(123)
+library(flowCore)
+library(flowViz)
+library(flowVS)
+library(flowAI)
+library(PeacoQC)
+library(CATALYST)
+library(CytoNorm)
+library(SingleCellExperiment)
+library(uwot)
+library(knitr)
+library(xlsx)
+```
+
+
+##Case A: Spectral flow cytometry dataset - ...
+
+### Manual quality control and pregating of spectral flow cytometry data
+Before proceeding to automated analyses, several manual gating steps are required for quality control and cleaning of the data. Manually exclude doublets and dead cells. After, gate your population of interest and export it als FCS files. Save these FCS files in a new folder *FCS files* in your working directory.
+
+### Importing spectral flowcytometry data
+The exported FCS 3.1 files can be stored in a folder *FCS files* and subsequently imported into the R environment with the FlowCore package. We will apply transformation of the data later, so transformation=FALSE. Furthermore, to prevent truncation of the data, truncate_max_range=FALSE. 
+
+```{r Importing FCS files A}
+fcs.dir<- file.path(getwd(), "FCS files")
+
+fcs_data <- read.flowSet(path=fcs.dir, pattern="*.fcs", transformation = FALSE, truncate_max_range = FALSE) #fcs_data will be a FlowSet object
+```
+
+Construct a data frame of your panel:
+
+```{r Panel-A}
+
+fcs_colname <- colnames(fcs_data)
+marker_class <- rep("none", ncol(fcs_data[[1]]))
+marker_state <- 36
+marker_class[marker_state] <- "state" #markers that indicate "state" of a cell, such as PDL1 marker, or use it to indicate markers you won't use for clustering
+marker_type <- c(8:35,38)
+marker_class[marker_type] <- "type" # markers that indicate surface markers, such as CD3, CD4, or markers that you do want to use for clustering
+marker_class <- factor(marker_class, levels=c("type", "state", "none"))
+antigen <- pData(parameters(fcs_data[[1]]))$desc
+
+panel <- data.frame(fcs_colname, antigen, marker_class, row.names = NULL)
+write.xlsx(panel, file="panel_A.xlsx", sheetName="Panel_A")
+
+```
+
+```{r Panel table-A, echo=FALSE}
+kable(panel)
+```
+
+### Transforming spectral flow cytometry data
+
+First, determine which markers you want to transform. You only have to transform the channels that you used for your experiment.
+```{r Transforming data A-1}
+markerstotransform <- panel$fcs_colname[c(8:36,38)]
+```
+
+Before calculating cofactors with the FlowVS package, we will downsample our data. Including more cells in finding the optimum cofactor will come with a computational cost. Bartlett’s statistics (Y-axis) are computed from density peaks after data is transformed by different cofactors (X-axis). An optimum cofactor is obtained where Bartlett’s statistics is minimum (indicated by red circles). The estParamFlowVs function will show you the plots were it based its values on. It is advised to export your cofactor data as an csv or excel file, this is for reproducibility purposes.
+
+##### Transforming your data with the FlowVS package
+
+```{r Transforming data with FlowVS package A, eval=FALSE }
+Downsampling_FlowSet <- function(x, samplesize , replace=TRUE, prob=NULL){
+  if(missing(samplesize))
+    samplesize <- min(flowCore::fsApply(x,nrow))
+  flowCore::fsApply(x, function(ff){
+    i <- sample(nrow(ff), size = samplesize, replace=replace, prob)
+    ff[i,]
+  })
+}
+
+fcs_data_small <- Downsampling_FlowSet(x=fcs_data, samplesize = 2000) #samplesize is the number of cells included, you can include more cells.
+
+cofactors <- estParamFlowVS(fcs_data_small, channels=markerstotransform)
+cofactordata <- data.frame(markerstotransform, cofactors)
+write.csv(x=cofactordata, file="cofactordata.csv") #csv file
+write.xlsx(x=cofactordata, file="cofactordata.xlsx", sheet="cofactordata_A")
+
+fcs_transform <- transFlowVS(fcs_data, channels = markerstotransform, cofactors)
+filenames <- sampleNames(fcs_data)
+sampleNames(fcs_transform) <- filenames
+
+```
+
+##### Transforming your data with a fixed cofactor
+
+```{r Transforming data with a fixed cofactor A, results='hide'}
+cofactor <- 3000
+l <- length(markerstotransform)
+cofactors<- rep(cofactor, l)
+
+fcs_transform <- transFlowVS(fcs_data, channels = markerstotransform, cofactors)
+filenames <- sampleNames(fcs_data)
+sampleNames(fcs_transform) <- filenames
+```
+
+To evaluate the data transformation, you can visualize density plots of markers with the FlowViz package. 
+
+```{r densityplots A}
+densityplot(~`FJComp-BUV496-A`, fcs_data[[1]]) #density plot before transformation, you can replace `FJComp-BUV496-A` by . to view all markers.
+
+densityplot(~`FJComp-BUV496-A`, fcs_transform[[1]]) # density plot after transformation
+``` 
+
+### Automatic quality control of flow cytometry data 
+Either flowAI or peacoQC package can be used to clean flow cytometry data. For Case A we demonstrate FlowAI, for Case B peacoQC.
+
+No pre-gated Time gate:
+```{r FlowAI, eval=FALSE}
+fcs_transform <- flow_auto_qc(fcs_transform) 
+```
+
+Pre-gated Time gate:
+```{r FlowAI not filtering time gate, results='hide', warning=FALSE}
+fcs_transform <- flow_auto_qc(fcs_transform, remove_from = "FS_FM") 
+
+outdir <- file.path(getwd(), "Transformed FCS files") 
+filenames <- paste("tf",fcs_data@phenoData@data$name)
+write.flowSet(fcs_transform, outdir = outdir, filename = filenames) #create a new directory with transformed FCS files
+``` 
+
+### Batch effects
+The next step is to correct batch effects, we will use the Cytonorm package to align our different files from different batches. We measured the same samples on different days (technical replicates) 
+
+```{r batch effect correction-1, message=FALSE}
+fcs.dir<- file.path(getwd(), "Transformed FCS files")
+
+files <- list.files(fcs.dir, pattern = "fcs$")
+train_files <- file.path(getwd(),"Transformed FCS files", list.files(fcs.dir, pattern="REU271"))
+validation_files <- file.path(getwd(), "Transformed FCS files", list.files(fcs.dir, pattern="REU272"))
+fsom <- prepareFlowSOM(train_files, colsToUse = markerstotransform, transformList = NULL, FlowSOM.params = list(xdim=10,ydim=10, nClus=20, scale=FALSE))
+``` 
+
+To check if clustering is appropriate:
+
+```{r batch effect correction-2, eval=FALSE}
+cvs <- testCV(fsom,cluster_values = c(5,10,15))
+```
+
+If the clusters are impacted by batch effects, CV values of >1.5/2 will occur, than you can also choose to put FlowSOM.params to NULL and skip clustering.
+
+Next, load a metadata file which includes at least a sample_id and a column defining the batches. You can include a column with filenames. 
+
+```{r batch effect correction-3}
+md <-read.csv(file="md.csv", header=TRUE, sep=";")
+```
+
+```{r batch effect correction-4, echo=FALSE}
+kable(md)
+```
+
+```{r batch effect correction-5, results='hide', message=FALSE}
+fcs.dir<- file.path(getwd(), "Transformed FCS files")
+file_names <- list.files(fcs.dir)
+file_name <- fsApply(fcs_transform, identifier)
+
+file_name %in% file_names #check if the order of files in the directory and order of files in FlowSet object are matching
+
+md <- data.frame(file_name, md, row.names=NULL)
+
+labels <- c("B", "C", "D", "E", "F", "A")
+
+
+model <- CytoNorm.train(files = train_files,
+                        labels = labels,
+                        channels = markerstotransform,
+                        transformList = NULL,
+                        FlowSOM.params = list(nCells = 6000, 
+                                              xdim = 10,
+                                              ydim = 10,
+                                              nClus = 5,
+                                              scale = FALSE),
+                        normMethod.train = QuantileNorm.train,
+                        normParams = list(nQ = 101,
+                                          goal = "mean"),
+                        seed = 1,
+                        verbose = TRUE)
+
+CytoNorm.normalize(model = model,
+                   files = validation_files,
+                   labels = labels,
+                   transformList = NULL,
+                   transformList.reverse = NULL,
+                   normMethod.normalize = QuantileNorm.normalize,
+                   outputDir = "Normalized",
+                   prefix = "Norm_",
+                   clean = TRUE,
+                   verbose = TRUE)
+
+fcs.dir<- file.path(getwd(), "Normalized")
+fcs_norm <- read.flowSet(path=fcs.dir, pattern="*.fcs", transformation = FALSE, truncate_max_range = FALSE)
+
+
+densityplot(~`FJComp-BUV496-A`, fcs_transform[13])#before normalization
+
+densityplot(~`FJComp-BUV496-A`, fcs_norm[3])#after normalization
+```
+
+At this point, you can take the FCS files from the Transformed files directory or Normalized FCS files directory and load these files into Cytosplore. More information about Cytosplore is available at: [https://www.cytosplore.org/]. You can skip arcsinh transformation for the data in Cytosplore.
+
+### Subsampling
+
+You can either use our Downsampling_FlowSet function to randomly select n cells per sample or you can split your data into a small training set and a larger test set.  
+```{r Downsampling function A}
+Downsampling_FlowSet <- function(x, samplesize , replace=TRUE, prob=NULL){
+  if(missing(samplesize))
+    samplesize <- min(flowCore::fsApply(x,nrow))
+  flowCore::fsApply(x, function(ff){
+    i <- sample(nrow(ff), size = samplesize, replace=replace, prob)
+    ff[i,]
+  })
+}
+
+fcs_transform <- fcs_transform[c(1:4,10,16)] #samples from batch A
+md <- md[c(1:4,10,16),] # samples from batch A
+
+
+Subsampling_FlowSet <- function(x, fraction, md){
+  b <- round(fraction*length(x), digits=0)
+  
+  listq <- sample(x=length(x), b, replace=FALSE)
+  listq <- sort(listq)
+  
+  fcs_train<-x[c(listq)]
+  
+  md_train <- md[c(listq),]
+  
+  
+fcs_train <<- fcs_train
+md_train <<- md_train
+
+  listy <- 1:length(x)
+  
+  listz <- subset(listy, !(listy %in% listq))
+  
+  listz <- sort(listz)
+  
+  fcs_test <- x[c(listz)]
+  
+  md_test <- md[c(listz),]
+  
+fcs_test <<- fcs_test
+md_test <<- md_test
+
+  }
+
+Subsampling_FlowSet(fcs_transform,0.25, md=md) #test and train set are created
+```
+
+### Exploring data with dimensionality reduction technique UMAP
+
+First, we can explore our data with an UMAP. UMAP will show the different populations present in the data and you can plot median expression of markers in the different clusters.
+
+```{r Exploring data with umap and optimizing parameters A}
+fcs_train <- Downsampling_FlowSet(fcs_train, samplesize =20000) # you can still downsample your training set if needed, but you can also include all or more cells
+
+sce_train <- prepData(fcs_train, md=md_train, panel= panel, FACS = TRUE, transform=FALSE, md_cols =list(file="file_name", id="Sample_ID", factors=c("Group_ID", "batch")))
+assayNames(sce_train)[1] <- "exprs"
+
+exprs_train <- assay(sce_train, "exprs")
+exprs_train <- t(exprs_train)
+exprs_train <- exprs_train[,c(marker_type)] #markers you want to use for clustering, you can also use marker_state or marker_type
+
+set.seed(1234)
+
+umap_train <- umap(exprs_train, n_neighbors=5)
+reducedDim(sce_train, "UMAP")<- umap_train
+plotDR(sce_train, "UMAP", color_by="sample_id")
+
+umap_train <- umap(exprs_train, n_neighbors=15)
+reducedDim(sce_train, "UMAP")<- umap_train
+plotDR(sce_train, "UMAP", color_by="sample_id")
+
+umap_train <- umap(exprs_train, n_neighbors=50)
+reducedDim(sce_train, "UMAP")<- umap_train
+plotDR(sce_train, "UMAP", color_by="sample_id")
+
+#if you chose the right n_neighbors, you can also test min_dist
+umap_train <- umap(exprs_train, n_neighbors=15, min_dist = 0.01)
+reducedDim(sce_train, "UMAP")<- umap_train
+plotDR(sce_train, "UMAP", color_by="sample_id")
+
+umap_train <- umap(exprs_train, n_neighbors=15, min_dist = 0.1)
+reducedDim(sce_train, "UMAP")<- umap_train
+plotDR(sce_train, "UMAP", color_by="sample_id")
+
+umap_train <- umap(exprs_train, n_neighbors=15, min_dist = 0.5)
+reducedDim(sce_train, "UMAP")<- umap_train
+plotDR(sce_train, "UMAP", color_by="sample_id")
+
+# choose the optimal parameters, to assess robustness of the umap you can vary the seed
+
+set.seed(1234)
+umap_train <- umap(exprs_train, n_neighbors=15, min_dist = 0.01)
+reducedDim(sce_train, "UMAP")<- umap_train
+plotDR(sce_train, "UMAP", color_by="sample_id")
+
+set.seed(7460)
+umap_train <- umap(exprs_train, n_neighbors=15, min_dist = 0.01)
+reducedDim(sce_train, "UMAP")<- umap_train
+plotDR(sce_train, "UMAP", color_by="sample_id")
+
+set.seed(5024)
+umap_train <- umap(exprs_train, n_neighbors=15, min_dist = 0.01, ret_model = TRUE)
+reducedDim(sce_train, "UMAP")<- umap_train$embedding
+plotDR(sce_train, "UMAP", color_by="sample_id")
+plotDR(sce_train, "UMAP", color_by="CD4")
+plotDR(sce_train, "UMAP", color_by="CD8")
+```
+
+Now you can add the other samples to the UMAP
+
+```{r Test UMAP with full dataset A}
+fcs_test <- Downsampling_FlowSet(fcs_test, samplesize =20000)
+
+sce_test <-prepData(fcs_test, md=md_test, panel= panel, FACS = TRUE, transform=FALSE, md_cols =list(file="file_name", id="Sample_ID", factors=c("Group_ID", "batch")))
+assayNames(sce_test)[1] <- "exprs"
+
+exprs_test <- assay(sce_test, "exprs")
+exprs_test <- t(exprs_test)
+exprs_test <- exprs_test[,c(marker_type)]
+
+umap_test <- umap_transform(exprs_test, umap_train)
+```
+
+The other samples can now be embedded:
+
+```{r Embed new data A}
+
+reducedDim(sce_train, "UMAP")<- NULL
+
+umap_total <- rbind(umap_train$embedding, umap_test)
+
+sce_total <- cbind(sce_train, sce_test)
+
+reducedDim(sce_total, "UMAP") <- umap_total
+
+plotDR(sce_total, "UMAP", color_by = "sample_id")
+plotDR(sce_total, "UMAP", color_by = "CD4")
+plotDR(sce_total, "UMAP", color_by = "CD8")
+```
+
+
+### Clustering data
+
+The CATALYST package provides functions to first cluster flow cytometry data with FlowSOM clustering and subsequently perform an UMAP or tSNE with the metacluster labels. Advantage of FlowSOM clustering is the speed of the algorithm and you don't need to downsample or split your dataset if the exploratory phase is over. 
+
+```{r Clustering A, message=FALSE}
+set.seed(5024)
+
+sce<- prepData(fcs_transform, md=md, panel= panel, FACS = TRUE, transform=FALSE, md_cols =list(file="file_name", id="Sample_ID", factors=c("Group_ID", "batch")))
+
+assayNames(sce)[1] <- "exprs"
+sce <- cluster(sce, features="type", maxK=12, seed=5024)
+```
+With maxK you specify the number of clusters. The number of clusters to choose can be difficult. First, you need to ask yourself how many clusters would you expect in your data.You can also use the UMAP of the earlier steps to guide you in choice for number of clusters. Plotting median expression of markers in that UMAP can help to see the number of populations you would expect. Vary the number of clusters to find what best fits your data and is biological relevant. 
+
+```{r Clustering-2 A, message=FALSE}
+sce <- runDR(sce, "UMAP", cells = 6000, features = "type")
+plotDR(sce, "UMAP", color_by="meta12")
+plotDR(sce, "UMAP", color_by="CD4")
+plotDR(sce, "UMAP", color_by="CD8")
+
+#Plot the number of cells per sample
+Cell_numbers <-plotCounts(sce, prop=FALSE, group_by = "sample_id")#change prop to TRUE to see frequencies
+print(Cell_numbers)
+Cell_numbers_data <- Cell_numbers[["data"]] #dataframe of number of cells per sample, could be useful if you want to export dataframe and use it to make graphs in other programs, such as Graphpad Prism
+
+#Heatmap of the median expression per marker per metacluster or sample, more information can be found in https://bioconductor.org/packages/release/bioc/html/CATALYST.html 
+
+plotExprHeatmap(sce, features = "type", by="cluster_id",k="meta12",scale = "last", q = 0, perc=TRUE,bars = FALSE)
+
+plotExprHeatmap(sce, features = "type", by="sample_id",k="meta12",scale = "last", q = 0, perc=TRUE,bars = FALSE) #this plot can also be used to check for batch effects 
+
+Cell_freq_clusters <- plotAbundances(sce, k = "meta12", group_by = "sample_id")
+print(Cell_freq_clusters)
+Cell_freq_clusters_data <- Cell_freq_clusters[["data"]]
+write.xlsx(x=Cell_freq_clusters_data, file="Cellclusterfrequencies.xlsx")
+
+```
+
+##Case B
+
+For Case B we used files from https://flowrepository.org/id/FR-FCM-Z3WR, the healthy control files:
+062CD8.fcs · 22CBD6.fcs · 52BA23.fcs · 655A91.fcs · 6FD678.fcs · 77DA77.fcs · 94D44E.fcs · B29A26.fcs · F5E7EF.fcs
+Files were first pre-gated on living single CD3+CD19-T cells in FlowJo. 
+
+```{r Importing FCS files B}
+
+fcs.dir<- file.path(getwd(), "FCS files 2")
+
+fcs_data <- read.flowSet(path=fcs.dir, pattern="*.fcs", transformation = FALSE, truncate_max_range = FALSE) 
+```
+
+```{r Panel B}
+fcs_colname <- colnames(fcs_data)
+marker_class <- rep("none", ncol(fcs_data[[1]]))
+marker_state <- c(13,14,16,19,22,36,38,40)
+marker_class[marker_state] <- "state" 
+marker_type <- c(7:12,17,18,20,21,23:35,37,39,41,42)
+marker_class[marker_type] <- "type" 
+marker_class <- factor(marker_class, levels=c("type", "state", "none"))
+antigen <- pData(parameters(fcs_data[[1]]))$desc
+
+panel_B <- data.frame(fcs_colname, antigen, marker_class, row.names = NULL)
+write.xlsx(panel_B, file="panel_B.xlsx", sheetName="Panel_B")
+
+markerstotransform <- panel_B$fcs_colname[c(7:29,31:42)]
+```
+
+##### Transforming your data with the FlowVS package
+
+```{r Transforming data with FlowVS package B, eval=FALSE }
+fcs_data_small <- Downsampling_FlowSet(x=fcs_data, samplesize = 2000) #samplesize is the number of cells included, you can include more cells.
+
+cofactors <- estParamFlowVS(fcs_data_small, channels=markerstotransform)
+cofactordata <- data.frame(markerstotransform, cofactors)
+write.csv(x=cofactordata, file="cofactordata_B.csv") #csv file
+write.xlsx(x=cofactordata, file="cofactordata_B.xlsx", sheet="cofactordata_B")
+
+fcs_transform <- transFlowVS(fcs_data, channels = markerstotransform, cofactors)
+```
+
+##### Transforming your data with a fixed cofactor
+
+```{r Transforming data with a fixed cofactor B, results='hide'}
+cofactor <- 3000
+l <- length(markerstotransform)
+cofactors<- rep(cofactor, l)
+
+fcs_transform <- transFlowVS(fcs_data, channels = markerstotransform, cofactors)
+filenames <- sampleNames(fcs_data)
+sampleNames(fcs_transform) <- filenames
+
+outdir <- file.path(getwd(), "Transformed FCS files 2")
+filenames <- paste("TF_",fcs_data@phenoData@data$name)
+write.flowSet(fcs_transform, outdir = outdir, filename = filenames)
+
+fcs.dir <- file.path(getwd(), "Transformed FCS files 2")
+fcs_transform <- read.flowSet(path=fcs.dir, pattern="*.fcs", transformation = FALSE, truncate_max_range = FALSE)
+
+```
+To evaluate the data transformation, you can visualize density plots of markers with the FlowViz package.
+
+```{r densityplots B}
+densityplot(~`BUV615-A`, fcs_data[[1]]) #density plot before transformation, you can replace `BUV615-A` by . to view all markers.
+
+densityplot(~`BUV615-A`, fcs_transform[[1]]) # density plot after transformation
+``` 
+
+### Automatic quality control of flow cytometry data 
+Either flowAI or peacoQC package can be used to clean flow cytometry data. For Case B we demonstrate peacoQC. You can run the peacoQC quality control first on 1 file to optimize the parameters. You will find the plot in the output directory and can check it to see what the algorithm removes. The first attempt could be not strict enough, because nothing is removed. The higher value for MAD, the less strict the algorithm is. In the last example with MAD of 2, the algorithm is very strict and removes almost 90% of the cells.
+
+```{r PeacoQC-1}
+ff <- fcs_transform[[1]]
+
+peacoqc_res <- PeacoQC(ff=ff, channels=markerstotransform, determine_good_cells = "all", save_fcs = FALSE, plot=TRUE, output_directory = "PeacoQCresults", IT_limit = 0.65, MAD=8)
+
+peacoqc_res <- PeacoQC(ff=ff, channels=markerstotransform, determine_good_cells = "all", save_fcs = FALSE, plot=TRUE, output_directory = "PeacoQCresults", IT_limit = 0.55, MAD=5)
+
+ff <- fcs_transform[[2]]
+peacoqc_res <- PeacoQC(ff=ff, channels=markerstotransform, determine_good_cells = "all", save_fcs = FALSE, plot=TRUE, output_directory = "PeacoQCresults", IT_limit = 0.55, MAD=2)
+```
+
+After choosing the right parameters, you can apply the algorithm to all samples.
+
+```{r PeacoQC-2, message=FALSE}
+for(i in 1:9){
+  ff <-fcs_transform[[i]]
+  
+  channels=markerstotransform
+  
+  peacoqc_res <- PeacoQC(ff, channels, determine_good_cells = "all", IT_limit=0.55, MAD=5, save_fcs = TRUE, plot=TRUE, output_directory = "PeacoQCresults")
+} 
+
+fcs.dir <- file.path(getwd(),"PeacoQCresults/PeacoQC_results/fcs_files")
+
+fcs_transform <- read.flowSet(path=fcs.dir, transformation=FALSE, truncate_max_range = FALSE) #construct new flowset from the cleaned files
+```
+
+### Batch effects
+
+In publically available datasets you might not always have access to control/technical replicate samples and you can not use Cytonorm to correct for batch effects. However, you can make an overview of the dates FCS files were measured and give a batch label to your files, to be able to see the influences of batches in downstream analysis.
+
+```{r Batch effect awareness}
+file_name <- fsApply(fcs_transform, identifier)
+sample_id <- keyword(fcs_data, "GUID")# if a Sample ID was added to the original file you could also extract Sample ID or for example TUBE NAME or construct a column with new sample id's yourself
+md_2 <- data.frame(file_name, sample_id, row.names=NULL)
+
+batch <- keyword(fcs_data, "$DATE")
+batch_label <- as.factor(batch)
+levels(batch_label) <- c("A", "B")
+
+md_2 <- data.frame(md_2, batch, batch_label, row.names=NULL)
+
+colnames(md_2) <- c("file_name","sample_id", "batch","batch_label")
+kable(md_2)
+```
+### Subsampling
+
+Before starting further data analysis, files can be downsampled or subsampled. 
+
+
+```{r Downsampling-2 }
+
+sce<- prepData(fcs_transform, md=md_2, panel= panel_B, FACS = TRUE, transform=FALSE, md_cols =list(file="file_name", id="sample_id", factors=c("batch", "batch_label"))) # you can specify the columns in your md file with md_cols
+
+Subsampling_FlowSet(fcs_transform,0.25, md=md_2) #test and train set are created
+```
+
+### Exploring data with dimensionality reduction technique UMAP
+
+First, we can explore our data with an UMAP. UMAP will show the different populations present in the data and you can plot median expression of markers in the different clusters.
+
+```{r Exploring data with umap and optimizing parameters B}
+fcs_train <- Downsampling_FlowSet(fcs_train, samplesize =20000) # you can still downsample your training set if needed, but you can include more cells
+
+sce_train <- prepData(fcs_train, md=md_train, panel= panel_B, FACS = TRUE, transform=FALSE, md_cols =list(file="file_name", id="sample_id", factors=c("batch", "batch_label")))
+assayNames(sce_train)[1] <- "exprs"
+
+exprs_train <- assay(sce_train, "exprs")
+exprs_train <- t(exprs_train)
+exprs_train <- exprs_train[,c(marker_state)] #markers you want to use for clustering
+
+umap_train <- umap(exprs_train, n_neighbors=5)
+reducedDim(sce_train, "UMAP")<- umap_train
+plotDR(sce_train, "UMAP", color_by="sample_id")
+
+umap_train <- umap(exprs_train, n_neighbors=15)
+reducedDim(sce_train, "UMAP")<- umap_train
+plotDR(sce_train, "UMAP", color_by="sample_id")
+
+umap_train <- umap(exprs_train, n_neighbors=50)
+reducedDim(sce_train, "UMAP")<- umap_train
+plotDR(sce_train, "UMAP", color_by="sample_id")
+
+#if you chose the right n_neighbors, you can also test min_dist
+umap_train <- umap(exprs_train, n_neighbors=15, min_dist = 0.01)
+reducedDim(sce_train, "UMAP")<- umap_train
+plotDR(sce_train, "UMAP", color_by="sample_id")
+
+umap_train <- umap(exprs_train, n_neighbors=15, min_dist = 0.1)
+reducedDim(sce_train, "UMAP")<- umap_train
+plotDR(sce_train, "UMAP", color_by="sample_id")
+
+umap_train <- umap(exprs_train, n_neighbors=15, min_dist = 0.5)
+reducedDim(sce_train, "UMAP")<- umap_train
+plotDR(sce_train, "UMAP", color_by="sample_id")
+
+# choose the optimal parameters, to assess robustness of the umap you can vary the seed
+
+set.seed(1234)
+umap_train <- umap(exprs_train, n_neighbors=50, min_dist = 0.01)
+reducedDim(sce_train, "UMAP")<- umap_train
+plotDR(sce_train, "UMAP", color_by="sample_id")
+
+set.seed(7460)
+umap_train <- umap(exprs_train, n_neighbors=50, min_dist = 0.01, ret_model = TRUE)
+reducedDim(sce_train, "UMAP")<- umap_train$embedding
+plotDR(sce_train, "UMAP", color_by="sample_id")
+
+plotDR(sce_train, "UMAP", color_by="sample_id")
+plotDR(sce_train, "UMAP", color_by="CD4")
+plotDR(sce_train, "UMAP", color_by="CD8")
+plotDR(sce_train, "UMAP", color_by="CCR6")# Now you can also plot your type markers on the UMAP
+```
+
+Now you can add the other samples to the UMAP
+
+```{r Test UMAP with full dataset B}
+fcs_test <- Downsampling_FlowSet(fcs_test, samplesize =20000)
+
+sce_test <- prepData(fcs_test, md=md_test, panel= panel_B, FACS = TRUE, transform=FALSE, md_cols =list(file="file_name", id="sample_id", factors=c("batch", "batch_label")))
+assayNames(sce_test)[1] <- "exprs"
+
+exprs_test <- assay(sce_test, "exprs")
+exprs_test <- t(exprs_test)
+exprs_test <- exprs_test[,c(marker_state)]
+
+umap_test <- umap_transform(exprs_test, umap_train)
+```
+
+The other samples can now be embedded:
+
+```{r Embed new data B}
+
+reducedDim(sce_train, "UMAP")<- NULL
+
+umap_total <- rbind(umap_train$embedding, umap_test)
+
+sce_total <- cbind(sce_train, sce_test)
+
+reducedDim(sce_total, "UMAP") <- umap_total
+
+plotDR(sce_total, "UMAP", color_by = "sample_id")
+plotDR(sce_total, "UMAP", color_by = "CD4")
+plotDR(sce_total, "UMAP", color_by = "CD8")
+```
+### Clustering data
+
+The CATALYST package provides functions to first cluster flow cytometry data with FlowSOM clustering and subsequently perform an UMAP or tSNE with the metacluster labels. Advantage of FlowSOM clustering is the speed of the algorithm and you don't need to downsample or split your dataset if the exploratory phase is over. 
+
+```{r Clustering B, message=FALSE}
+set.seed(7460)
+
+sce<- prepData(fcs_transform, md=md_2, panel= panel_B, FACS = TRUE, transform=FALSE, md_cols =list(file="file_name", id="sample_id", factors=c("batch", "batch_label")))
+
+assayNames(sce)[1] <- "exprs"
+sce <- cluster(sce, features="state", maxK=8, seed=7460)
+```
+With maxK you specify the number of clusters. The number of clusters to choose can be difficult. First, you need to ask yourself how many clusters would you expect in your data.You can also use the UMAP of the earlier steps to guide you in choice for number of clusters. Plotting median expression of markers in that UMAP can help to see the number of populations you would expect. Vary the number of clusters to find what best fits your data and is biological relevant. 
+
+```{r Clustering-2 B, message=FALSE}
+sce <- runDR(sce, "UMAP", cells = 6000, features = "state")
+plotDR(sce, "UMAP", color_by="meta8")
+plotDR(sce, "UMAP", color_by="CD4")
+plotDR(sce, "UMAP", color_by="CD8")
+plotDR(sce, "UMAP", color_by="batch_label") #to check how batches are divided over the clusters
+plotDR(sce, "UMAP", color_by="sample_id")
+
+#Plot the number of cells per sample
+Cell_numbers <-plotCounts(sce, prop=FALSE, group_by = "sample_id")#change prop to TRUE to see frequencies
+print(Cell_numbers)
+Cell_numbers_data <- Cell_numbers[["data"]] #dataframe of number of cells per sample, could be useful if you want to export dataframe and use it to make graphs in other programs, such as Graphpad Prism
+
+#Heatmap of the median expression per marker per metacluster or sample, more information can be found in https://bioconductor.org/packages/release/bioc/html/CATALYST.html 
+
+plotExprHeatmap(sce, features = "state", by="cluster_id",k="meta8",scale = "last", q = 0, perc=TRUE,bars = FALSE)
+
+plotExprHeatmap(sce, features = "state", by="sample_id",k="meta8",scale = "last", q = 0, perc=TRUE,bars = FALSE) #this plot can also be used to check for batch effects, the two batches clearly cluster differently with hierarchical clustering 
+
+Cell_freq_clusters <- plotAbundances(sce, k = "meta8", group_by = "sample_id")
+print(Cell_freq_clusters)
+Cell_freq_clusters_data <- Cell_freq_clusters[["data"]]
+write.xlsx(x=Cell_freq_clusters_data, file="Cellclusterfrequencies.xlsx")
+
+```
+
+```{r Session info}
+sessionInfo()
+```
+
+

@@ -193,7 +193,7 @@ fcs.dir<- file.path(getwd(), "Transformed FCS files")
 file_names <- list.files(fcs.dir)
 file_name <- fsApply(fcs_transform, identifier)
 
-file_name %in% file_names #check if the order of files in the directory and order of files in FlowSet object are matching
+file_name == file_names #check if the order of files in the directory and order of files in FlowSet object are matching
 
 md <- data.frame(file_name, md, row.names=NULL)
 
